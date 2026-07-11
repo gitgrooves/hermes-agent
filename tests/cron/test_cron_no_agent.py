@@ -261,6 +261,33 @@ def test_run_job_no_agent_script_failure_delivers_error(hermes_env):
     assert "Cron watchdog" in final_response  # alert header
 
 
+def test_no_agent_timeout_is_not_mislabeled_as_provider_failure():
+    """Deterministic script timeouts must not mention providers or fallbacks."""
+    from cron.scheduler import _summarize_cron_failure_for_delivery
+
+    message = _summarize_cron_failure_for_delivery(
+        {"id": "watch-1", "name": "Gateway watchdog", "no_agent": True},
+        "Script timed out after 120 seconds",
+    )
+
+    assert "script timeout" in message
+    assert "provider" not in message.lower()
+    assert "fallback chain" not in message.lower()
+
+
+def test_agent_timeout_remains_a_provider_failure():
+    """Agent-backed timeout copy should retain provider/fallback guidance."""
+    from cron.scheduler import _summarize_cron_failure_for_delivery
+
+    message = _summarize_cron_failure_for_delivery(
+        {"id": "agent-1", "name": "Research brief", "no_agent": False},
+        "ReadTimeout: request timed out",
+    )
+
+    assert "provider timeout" in message
+    assert "Fallback chain" in message
+
+
 def test_run_job_no_agent_never_invokes_aiagent(hermes_env):
     """no_agent jobs must NOT import/construct the AIAgent."""
     from cron.jobs import create_job
