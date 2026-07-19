@@ -2232,39 +2232,109 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         raise
 
 
+# A WAL checkpoint updates the header's page-count field and physically
+# extends the main db file as separate steps of the same operation; a raw
+# stat + header read taken mid-checkpoint can observe the new count before
+# the file has finished growing to match. That resolves within microseconds
+# on its own, so give it one short beat before treating a mismatch as real.
+_TORN_EXTEND_RETRY_DELAY_S = 0.01  # 10ms
+
+
+def _measure_file_length(conn: sqlite3.Connection) -> Optional[tuple[str, int, int]]:
+    """Return ``(path, header_page_count, actual_pages)``, or ``None`` to skip.
+
+    Reads the on-disk header page-count (bytes 28-31 of page 1) and the
+    physical file size independently via raw filesystem calls -- this is
+    intentionally not routed through the connection's own (WAL-index-aware)
+    view, since the whole point is to catch the main file itself lagging
+    behind what its own header claims.
+    """
+    row = conn.execute("PRAGMA database_list").fetchone()
+    if row is None:
+        return None
+    path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
+    if not path_str:
+        return None  # in-memory or unnamed DB; skip
+    path = path_str
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    file_size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(28)
+        header_bytes = f.read(4)
+    if len(header_bytes) < 4:
+        return None  # can't read header; skip
+    header_page_count = int.from_bytes(header_bytes, "big")
+    if header_page_count == 0:
+        return None  # new/empty DB; skip
+    actual_pages = file_size // page_size
+    return path, header_page_count, actual_pages
+
+
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
     """Read the SQLite header page_count and compare against actual file size.
 
     Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).
+    (torn-extend corruption) -- but only after a bounded re-read and
+    ``PRAGMA integrity_check`` corroboration both still show a problem.
+
+    A single raw stat+header read can race a legitimate, in-flight WAL
+    checkpoint (see :data:`_TORN_EXTEND_RETRY_DELAY_S`), so a mismatch alone
+    is not proof of corruption: it gets one fresh re-measurement, and if that
+    still disagrees, a corroborating ``integrity_check`` (the same probe
+    :func:`_guard_existing_db_is_healthy` uses, which reads through SQLite's
+    own WAL-aware engine rather than a raw file handle) before raising. A
+    transient extend never fails ``integrity_check``; real torn-extend
+    corruption does.
     """
     try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        if row is None:
+        measurement = _measure_file_length(conn)
+        if measurement is None:
             return
-        path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
-        if not path_str:
-            return  # in-memory or unnamed DB; skip
-        path = path_str
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
-            return  # new/empty DB; skip
-        actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
-            raise sqlite3.DatabaseError(
-                f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
-                f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
-                f"file_size={file_size}, page_size={page_size})"
+        path, header_page_count, actual_pages = measurement
+        if actual_pages >= header_page_count:
+            return
+
+        # Possible mid-checkpoint race: let the extend finish and re-measure
+        # fresh before treating this as corruption.
+        time.sleep(_TORN_EXTEND_RETRY_DELAY_S)
+        measurement = _measure_file_length(conn)
+        if measurement is None:
+            return
+        path, header_page_count, actual_pages = measurement
+        if actual_pages >= header_page_count:
+            return  # transient -- extend caught up, no real problem
+
+        # Still mismatched after the re-read: corroborate against
+        # integrity_check before concluding this is real corruption.
+        integrity_ok = False
+        integrity_detail = "<integrity_check raised>"
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            integrity_detail = row[0] if row else "<no row>"
+            integrity_ok = bool(row) and (row[0] or "").lower() == "ok"
+        except sqlite3.DatabaseError as exc:
+            integrity_detail = str(exc)
+
+        if integrity_ok:
+            # The size check still disagrees but SQLite's own WAL-aware
+            # reader finds the DB intact -- log and move on rather than
+            # raising on a check that has just proven itself unreliable for
+            # this file/filesystem right now.
+            _log.warning(
+                "torn-extend size check disagreed with integrity_check on "
+                "%s (header claims %d pages, file has %d pages); "
+                "integrity_check passed, not raising",
+                path, header_page_count, actual_pages,
             )
+            return
+
+        raise sqlite3.DatabaseError(
+            f"torn-extend detected: page count mismatch on {path}: "
+            f"header claims {header_page_count} pages, "
+            f"file has {actual_pages} pages "
+            f"(missing {header_page_count - actual_pages} pages); "
+            f"integrity_check corroborated: {integrity_detail}"
+        )
     except sqlite3.DatabaseError:
         raise
     except Exception:

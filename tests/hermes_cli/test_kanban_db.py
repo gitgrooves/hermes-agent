@@ -4464,28 +4464,104 @@ def test_write_txn_healthy_commit_no_exception(tmp_path):
     conn.close()
 
 
-def test_write_txn_raises_on_truncated_file(tmp_path):
-    """A mocked smaller file size triggers the torn-extend check."""
+def test_write_txn_transient_size_mismatch_self_heals(tmp_path):
+    """A mismatch that resolves on re-read (simulated mid-checkpoint extend)
+    does not raise -- and does not need integrity_check to save it.
+
+    Regression test for the torn-extend false-positive (card t_9e3c81a5):
+    the very first raw stat can race a legitimate, in-flight WAL checkpoint
+    that has already updated the header's page count but not yet finished
+    physically extending the file. That's self-healing, not corruption.
+    """
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
-    # Get actual page size so we can fake a smaller file
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    original_getsize = os.path.getsize
+    call_count = 0
+
+    def fake_getsize(path):
+        nonlocal call_count
+        call_count += 1
+        real_size = original_getsize(path)
+        if call_count == 1:
+            # First read: file appears one page short (extend still in flight).
+            return max(0, real_size - page_size)
+        # Every subsequent read: the extend has caught up.
+        return real_size
+
+    with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
+        with write_txn(conn) as c:
+            c.execute(
+                "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+                "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
+            )
+    assert call_count >= 2, "expected the invariant check to re-measure after the first mismatch"
+    row = conn.execute("SELECT title FROM tasks WHERE id='t_test02'").fetchone()
+    assert row["title"] == "test task 2"
+    conn.close()
+
+
+def test_write_txn_persistent_size_mismatch_cleared_by_integrity_check(tmp_path, caplog):
+    """A size check that never resolves on its own, against a genuinely
+    healthy file, is cleared by integrity_check corroboration rather than
+    raising a false torn-extend error -- and logs a warning so the
+    disagreement is still visible.
+    """
+    from hermes_cli.kanban_db import connect, write_txn
+    db = tmp_path / "test.db"
+    conn = connect(db_path=db)
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     original_getsize = os.path.getsize
 
     def fake_getsize(path):
-        # Return a size that implies at least 1 fewer page than header claims
+        # Always lies smaller: the heuristic never self-resolves, but the
+        # underlying file is (and stays) genuinely healthy.
         real_size = original_getsize(path)
         return max(0, real_size - page_size)
 
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
+    with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
         with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
             with write_txn(conn) as c:
                 c.execute(
                     "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
-                    "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
+                    "VALUES ('t_test03', 'test task 3', 'tester', 'todo', 0, 1234567890)"
                 )
+    assert any("torn-extend" in rec.message and "integrity_check" in rec.message for rec in caplog.records)
+    row = conn.execute("SELECT title FROM tasks WHERE id='t_test03'").fetchone()
+    assert row["title"] == "test task 3"
     conn.close()
+
+
+def test_write_txn_raises_on_truncated_file(tmp_path):
+    """Real, persistent corruption (genuinely truncated file) still raises:
+    the re-read cannot resolve it and integrity_check corroborates the
+    problem instead of clearing it."""
+    import struct
+    from hermes_cli.kanban_db import connect, write_txn
+    db = tmp_path / "test.db"
+    conn = connect(db_path=db)
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    with write_txn(conn) as c:
+        c.execute(
+            "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+            "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
+        )
+    conn.close()
+
+    with open(db, "rb") as f:
+        data = bytearray(f.read())
+    real_page_count = struct.unpack(">I", data[28:32])[0]
+    if real_page_count < 2:
+        pytest.skip("DB too small for synthetic truncation test")
+    with open(db, "wb") as f:
+        f.write(bytes(data[: (real_page_count - 1) * page_size]))
+
+    raw_conn = sqlite3.connect(str(db), isolation_level=None)
+    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
+        from hermes_cli.kanban_db import _check_file_length_invariant
+        _check_file_length_invariant(raw_conn)
+    raw_conn.close()
 
 
 def test_write_txn_post_commit_check_fires_every_call(tmp_path):
