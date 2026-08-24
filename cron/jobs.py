@@ -622,6 +622,7 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "last_delivery_outcome": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -766,15 +767,21 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 delivery_outcome: Optional[str] = None):
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+
+    ``delivery_outcome`` records a non-default delivery decision for the
+    run — currently ``'suppressed'`` when the scheduler's JT-value gate
+    withheld a successful message (see cron.notification_gate).  ``None``
+    (the default) means delivery followed the normal path.
     """
     with _jobs_file_lock:
         jobs = load_jobs()
@@ -786,6 +793,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Gate decision for this run — cleared when delivery is normal
+                job["last_delivery_outcome"] = delivery_outcome
                 
                 # Increment completed count
                 if job.get("repeat"):

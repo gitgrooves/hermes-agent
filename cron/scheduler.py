@@ -123,6 +123,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.notification_gate import should_suppress_delivery
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1747,6 +1748,31 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
 
+                # Defence-in-depth JT-value gate: a *successful* human-facing
+                # message that explicitly self-identifies as non-actionable
+                # ("Needs JT: none", "Bob will reconcile silently") is
+                # suppressed pre-delivery.  Output is already saved above;
+                # failure alerts and deliver=local are never gated, and any
+                # material signal fails open inside the gate itself.  (Minimal
+                # internal form of upstream hermes-agent#74546.)
+                delivery_outcome = None
+                if (
+                    should_deliver
+                    and success
+                    and _normalize_deliver_value(job.get("deliver", "local")) != "local"
+                ):
+                    gate_reason = should_suppress_delivery(deliver_content)
+                    if gate_reason:
+                        logger.info(
+                            "jt_value_gate: suppressed delivery job=%s name=%r reason=%s deliver=%s",
+                            job["id"],
+                            job.get("name", job["id"]),
+                            gate_reason,
+                            job.get("deliver"),
+                        )
+                        should_deliver = False
+                        delivery_outcome = "suppressed"
+
                 delivery_error = None
                 if should_deliver:
                     try:
@@ -1762,7 +1788,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                mark_job_run(job["id"], success, error, delivery_error=delivery_error,
+                             delivery_outcome=delivery_outcome)
                 return True
 
             except Exception as e:
